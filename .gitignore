@@ -1,0 +1,26 @@
+# === RePAST Privacy & Security Exclusions ===
+
+# Sensitive Research Data (PII)
+preprocessed_audio/
+diarization_data/
+initial_transcription/
+aligned_textgrids/
+models/embeddings/
+
+# Authentication
+HuggingFaceToken.txt
+
+# === Technical & Build Exclusions ===
+# Compiled C-Modules and Binaries
+bin/
+*.so
+*.pyd
+*.dylib
+
+# Logs and Caches
+logs/
+__pycache__/
+.ipynb_checkpoints/
+
+# Large External Models
+models/syllable_dicts/

@@ -1,0 +1,27 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it as follows."
+authors:
+  - family-names: Taylor
+    given-names: S. P.
+title: "RePAST: Revised Accessible Pipeline for Automated Transcription"
+version: 1.0.0
+date-released: "2026-03-20"
+abstract: >-
+  RePAST is a modular Python pipeline that automates the transcription and 
+  alignment of long-form audio for phonetic research. It integrates 
+  state-of-the-art components—including OpenAI Whisper, PyAnnote.audio, 
+  and the Montreal Forced Aligner—to transform raw audio into linguistically 
+  enriched, time-aligned transcripts. Specifically designed to handle 
+  non-standard dialects and sociolinguistic data, the system 
+  prioritizes accessibility for researchers without computational training 
+  and ensures reproducibility through a robust, local-first architecture.
+keywords:
+  - "forced alignment"
+  - "phonetic analysis"
+  - "speech processing"
+  - "dialectology"
+  - "computational linguistics"
+  - "sociolinguistics"
+  - "reproducibility"
+license: MIT
+repository-code: "https://github.com/your-username/RePAST"
