@@ -6,6 +6,7 @@ authors:
 title: "RePAST: Revised Accessible Pipeline for Automated Transcription"
 version: 1.0.0
 date-released: "2026-03-20"
+DOI: https://doi.org/10.5281/zenodo.19140616
 abstract: >-
   RePAST is a modular Python pipeline that automates the transcription and 
   alignment of long-form audio for phonetic research. It integrates 
