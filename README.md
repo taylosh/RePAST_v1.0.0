@@ -75,7 +75,7 @@ Automatic Fallback: If the C-modules or GPU are unavailable, the pipeline automa
 --------------------------------------------------------------------------------
 9. Citing this Work
 If you use this pipeline in your research, please cite it as follows:
-Taylor, S. P. (2026). RePAST: Revised Accessible Pipeline for Automated Transcription. [Software].
+Taylor, S. P. (2026). RePAST: Revised Accessible Pipeline for Automated Transcription. [Software]. https://doi.org/10.5281/zenodo.19140616
 Reproducibility Note: It is recommended that you include your requirements-lock.txt and the specific version of the _preprocessed audio files when publishing your methodology.
 --------------------------------------------------------------------------------
 ACKNOWLEDGEMENT & THIRD-PARTY CITATIONS
