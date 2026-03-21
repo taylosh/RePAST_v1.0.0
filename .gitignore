@@ -5,7 +5,7 @@ preprocessed_audio/
 diarization_data/
 initial_transcription/
 aligned_textgrids/
-models/embeddings/
+models/
 
 # Authentication
 HuggingFaceToken.txt
