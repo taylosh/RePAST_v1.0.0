@@ -700,7 +700,7 @@ def save_outputs(audio_stem: str, transcriptions: Dict[str, List[Tuple]],
     combined_text = []
     
     for speaker_id, intervals in transcriptions.items():
-        tier_name = f"{speaker_id}_phrases" if speaker_id != "default" else "phrases"
+        tier_name = f"{speaker_id}_phrases" if speaker_id != "default" else "Speaker_phrases"
         
         if RICH_AVAILABLE and not batch_mode:
             console.print(f"Creating tier '{tier_name}' with {len(intervals)} intervals")
