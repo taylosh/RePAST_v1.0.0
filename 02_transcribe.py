@@ -1,8 +1,8 @@
 """
 02_transcribe.py - Consolidated Transcription Hub
 @author: taylosh
-Created on Aug 21 2024  
-Last edited on Mar 16 2026
+Created on 21 Aug 2024  
+Last edited on 6 May 2026
 
 Main transcription engine for the overhauled ASR pipeline.
 - Utilizes OpenAI Whisper for high-fidelity speech-to-text.
@@ -149,10 +149,10 @@ def get_segmentation_parameters():
         adaptive_choice = Prompt.ask(
             "Use Automatic Adaptive Thresholds?", 
             choices=["y", "n", "yes", "no"], 
-            default="y"
+            default="n"
         )
     else:
-        adaptive_choice = input("Use Automatic Adaptive Thresholds? (Y/n): ").strip().lower() or "y"
+        adaptive_choice = input("Use Automatic Adaptive Thresholds? (Y/n): ").strip().lower() or "n"
     
     use_adaptive = adaptive_choice in ['y', 'yes']
     
@@ -318,7 +318,8 @@ def get_language_from_user():
         11: {"name": "Arabic", "code": "ar"},
         12: {"name": "Hindi", "code": "hi"},
         13: {"name": "Korean", "code": "ko"},
-        14: {"name": "Auto-detect", "code": "auto"}
+        14: {"name": "Auto-detect", "code": "auto"},
+        15: {"name": "Manual entry (enter language code)", "code": "manual"}
     }
     
     if RICH_AVAILABLE:
@@ -340,6 +341,26 @@ def get_language_from_user():
             choice = int(input("\nSelect language (default: 14 - Auto-detect): ").strip() or "14")
         except ValueError:
             choice = 14
+    
+    # Handle manual entry
+    if choice == 15:
+        if RICH_AVAILABLE:
+            manual_code = Prompt.ask("Enter language code (e.g., 'ca' for Catalan, 'el' for Greek)")
+        else:
+            manual_code = input("Enter language code (e.g., 'ca' for Catalan, 'el' for Greek): ").strip()
+        
+        if manual_code:
+            if RICH_AVAILABLE:
+                console.print(f"[green]Using manual language code: {manual_code}[/green]")
+            else:
+                print(f"Using manual language code: {manual_code}")
+            return manual_code.lower()
+        else:
+            if RICH_AVAILABLE:
+                console.print("[yellow]No code entered, falling back to Auto-detect[/yellow]")
+            else:
+                print("No code entered, falling back to Auto-detect")
+            return "auto"
     
     if choice not in languages:
         if RICH_AVAILABLE:
@@ -413,9 +434,11 @@ def parse_arguments():
                         help='Output directory for transcriptions')
     
     # Core transcription options
-    parser.add_argument('--language', '-l', type=str, choices=['en', 'es', 'fr', 'de', 'it', 'pt', 
-                       'nl', 'ru', 'ja', 'zh', 'ar', 'hi', 'ko', 'auto'], default='auto',
-                       help='Language code for transcription')
+    parser.add_argument('--language', '-l', type=str, 
+                    choices=['en', 'es', 'fr', 'de', 'it', 'pt', 
+                            'nl', 'ru', 'ja', 'zh', 'ar', 'hi', 'ko', 'auto'],
+                    default='auto',
+                    help='Language code for transcription')
     parser.add_argument('--model', '-m', type=str, choices=['tiny', 'base', 'small', 'medium', 'large'],
                        default='base', help='Whisper model size')
     
@@ -714,12 +737,14 @@ def save_outputs(audio_stem: str, transcriptions: Dict[str, List[Tuple]],
         for start, end, text in intervals:
             combined_text.append(f"[{speaker_id}] {start:.2f}-{end:.2f}s: {text}")
     
+    # ============================================
+    # SAVE TO initial_transcription/textgrids/
+    # ============================================
     textgrid_dir = output_dir / "textgrids" / relative_path
     transcript_dir = output_dir / "transcripts" / relative_path
     
     tg_out = textgrid_dir / f"{audio_stem}.TextGrid"
     tg_out.parent.mkdir(parents=True, exist_ok=True)
-    
     tg.save(str(tg_out), format="long_textgrid", includeBlankSpaces=True)
     
     txt_out = transcript_dir / f"{audio_stem}.txt"
@@ -729,12 +754,25 @@ def save_outputs(audio_stem: str, transcriptions: Dict[str, List[Tuple]],
     
     if RICH_AVAILABLE and not batch_mode:
         console.print(f"Saved TextGrid and transcript for {audio_stem}")
-
+    
+    # ============================================
+    # NEW: COPY TO final_textgrids/ (maintain structure)
+    # ============================================
+    final_textgrids_dir = Path("./final_textgrids") / relative_path
+    final_tg_out = final_textgrids_dir / f"{audio_stem}.TextGrid"
+    final_tg_out.parent.mkdir(parents=True, exist_ok=True)
+    
+    # Save a copy to final_textgrids
+    tg.save(str(final_tg_out), format="long_textgrid", includeBlankSpaces=True)
+    
+    if RICH_AVAILABLE and not batch_mode:
+        console.print(f"[dim]Also saved copy to {final_tg_out}[/dim]")
+        
 def transcribe_only(input_file: Path, output_dir: Path, relative_path: Path,
                    use_diarization: bool, diarization_config: dict,
                    lang_code: str, model_size: str,
                    silence_thresh: int = -28, min_silence_len: int = 100,
-                   use_adaptive: bool = True,
+                   use_adaptive: bool = False,
                    batch_mode: bool = False):
     """Transcribe a single audio file"""
     try:
@@ -980,7 +1018,7 @@ def main():
             silence_thresh = segmentation_config['silence_threshold']
         else:
             # Defaults when diarization is on (these won't be used anyway)
-            use_adaptive = True
+            use_adaptive = False
             min_silence_len = 100
             silence_thresh = None
         
@@ -1029,12 +1067,12 @@ def main():
                 console.print(f"\n[green]Diarization enabled with {len(selected_profiles)} profiles[/green]")
             
             # Set defaults for segmentation (won't be used)
-            use_adaptive = True
+            use_adaptive = False
             min_silence_len = 100
             silence_thresh = None
         else:
             # When diarization is off, use args for segmentation
-            use_adaptive = True  # Default to adaptive in batch mode
+            use_adaptive = False  # Default not adaptive in batch mode
             min_silence_len = args.min_silence_len
             silence_thresh = args.silence_threshold
         
