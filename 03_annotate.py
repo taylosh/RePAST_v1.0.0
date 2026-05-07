@@ -1,14 +1,27 @@
 """
 03_annotate.py - Alignment & Annotation Hub
 @author: taylosh
-Created on Nov 15 2025
-Last edited on Mar 16 2026
+Created on 15 Nov 2025
+Last edited on 6 May 2026
 
 Main alignment engine for the overhauled ASR pipeline.
 - Automatically generates MFA corpus from Phase 2 TextGrids.
 - Uses C-accelerated audio_segment_engine for high-speed chunking (with Python fallback).
 - Performs Segment-to-Phoneme alignment via Montreal Forced Aligner.
 - Integrated subscripts: libs/syllabify.py and libs/tag.py.
+- Preservation of original filenames with "_aligned" suffix.
+"""
+"""
+03_annotate.py - Alignment & Annotation Hub
+@author: taylosh
+Created on Nov 15 2025
+Last edited on Mar 30 2026
+
+Main alignment engine for the overhauled ASR pipeline.
+- Automatically generates MFA corpus from Phase 2 TextGrids.
+- Uses C-accelerated audio_segment_engine for high-speed chunking (with Python fallback).
+- Performs Segment-to-Phoneme alignment via Montreal Forced Aligner.
+- Integrated subscripts: libs/syllabify.py, libs/tag.py, and libs/intonalyze_A.py.
 - Preservation of original filenames with "_aligned" suffix.
 """
 
@@ -60,6 +73,18 @@ except ImportError:
         def print(self, *args, **kwargs): print(*args)
     console = FallbackConsole()
 
+def normalize_mfa_model_name(model_input: str) -> str:
+    """
+    Normalize MFA model name.
+    If it already ends with '_mfa', return as-is.
+    Otherwise, append '_mfa'.
+    """
+    model_input = model_input.strip()
+    if model_input.endswith('_mfa'):
+        return model_input
+    else:
+        return f"{model_input}_mfa"
+    
 # ============================================================================
 # COMMAND LINE ARGUMENT PARSING
 # ============================================================================
@@ -73,8 +98,12 @@ def parse_arguments():
                         help='Directory containing transcribed TextGrid files from Phase 2')
     parser.add_argument('--audio-dir', '-a', type=str,
                         help='Directory containing preprocessed audio files')
+    parser.add_argument('--syllabification-use-rules', action='store_true', default=True,
+                    help='Enable rule-based proofreading for syllabification')
+    parser.add_argument('--syllabification-no-rules', dest='syllabification_use_rules', 
+                        action='store_false', help='Disable rule-based proofreading')
     parser.add_argument('--output-dir', '-o', type=str, default='./aligned_textgrids',
-                        help='Output directory for aligned TextGrids')
+                            help='Output directory for aligned TextGrids')
     parser.add_argument('--language', '-l', type=str, default='english',
                         choices=['english', 'spanish', 'french', 'german', 'italian', 
                                 'portuguese', 'dutch', 'russian', 'mandarin', 'japanese', 
@@ -86,6 +115,8 @@ def parse_arguments():
                         help='Enable syllabification after alignment')
     parser.add_argument('--enable-pos-tagging', action='store_true',
                         help='Enable POS tagging after alignment')
+    parser.add_argument('--enable-intonation', action='store_true',
+                        help='Enable intonation analysis (Break Index assignment) - Spanish only')
     
     # MFA model configuration
     parser.add_argument('--mfa-auto-download', action='store_true', default=True,
@@ -124,6 +155,10 @@ def parse_arguments():
     parser.add_argument('--pos-no-auto-download', dest='pos_auto_download', 
                         action='store_false', help='Disable auto-download of spaCy models')
     
+    # Intonation arguments
+    parser.add_argument('--intonation-clitics-path', type=str, default=None,
+                        help='Path to custom clitics CSV file (Spanish only)')
+    
     # General
     parser.add_argument('--non-interactive', action='store_true',
                         help='Run in non-interactive mode (use provided arguments)')
@@ -141,7 +176,8 @@ def check_mfa_model(language: str, auto_download: bool = True) -> bool:
     import subprocess
     import sys
     
-    model_name = f"{language}_mfa"
+    # Normalize the model name (don't double-add _mfa)
+    model_name = normalize_mfa_model_name(language)
     
     # Try to check if model exists by attempting to get its info
     try:
@@ -206,57 +242,287 @@ LANGUAGE_OPTIONS = {
 }
 
 def select_language() -> str:
-    """Display numbered language menu and get user selection."""
+    """Display numbered language menu and get user selection with full model management."""
+    
+    # First, get list of available MFA models on the system
+    available_models = []
+    try:
+        result = subprocess.run(["mfa", "model", "list", "acoustic"], 
+                                capture_output=True, text=True, timeout=10)
+        if result.returncode == 0 and result.stdout:
+            available_models = [line.strip() for line in result.stdout.strip().split('\n') if line.strip()]
+    except Exception as e:
+        logger.debug(f"Could not list MFA models: {e}")
+    
+    LANGUAGE_OPTIONS = {
+        1: {"name": "English", "code": "english"},
+        2: {"name": "Spanish", "code": "spanish"},
+        3: {"name": "French", "code": "french"},
+        4: {"name": "German", "code": "german"},
+        5: {"name": "Italian", "code": "italian"},
+        6: {"name": "Portuguese", "code": "portuguese"},
+        7: {"name": "Dutch", "code": "dutch"},
+        8: {"name": "Russian", "code": "russian"},
+        9: {"name": "Mandarin", "code": "mandarin"},
+        10: {"name": "Japanese", "code": "japanese"},
+        11: {"name": "Korean", "code": "korean"},
+        12: {"name": "Arabic", "code": "arabic"},
+        13: {"name": "Manual entry (enter MFA model name)", "code": "manual"},
+        14: {"name": "Browse available MFA models", "code": "browse"},
+        15: {"name": "Enter custom model path", "code": "custom_path"}
+    }
     
     if RICH_AVAILABLE:
         # Rich menu display
-        table = Table(title="Available Languages for MFA Alignment")
+        table = Table(title="MFA Model Selection")
         table.add_column("Option", style="cyan", no_wrap=True)
-        table.add_column("Language", style="green")
-        table.add_column("Code", style="dim")
+        table.add_column("Language / Model Source", style="green")
+        table.add_column("Description", style="dim")
         
         for num, lang_info in LANGUAGE_OPTIONS.items():
-            table.add_row(str(num), lang_info["name"], lang_info["code"])
+            if num == 13:
+                table.add_row(str(num), lang_info["name"], "type any valid MFA model name")
+            elif num == 14:
+                table.add_row(str(num), lang_info["name"], "select from models on your system")
+            elif num == 15:
+                table.add_row(str(num), lang_info["name"], "use full filesystem path to custom model")
+            else:
+                table.add_row(str(num), lang_info["name"], lang_info["code"])
         
         console.print(table)
-        choice = IntPrompt.ask("Select language", default=1)
+        choice = IntPrompt.ask("Select model option", default=1)
     else:
         # Fallback console menu
-        print("\nAvailable Languages for MFA Alignment:")
-        print("-" * 40)
+        print("\nMFA Model Selection:")
+        print("-" * 60)
         for num, lang_info in LANGUAGE_OPTIONS.items():
-            print(f"  {num}. {lang_info['name']} ({lang_info['code']})")
-        print("-" * 40)
+            if num == 13:
+                print(f"  {num}. {lang_info['name']}")
+            elif num == 14:
+                print(f"  {num}. {lang_info['name']}")
+            elif num == 15:
+                print(f"  {num}. {lang_info['name']}")
+            else:
+                print(f"  {num}. {lang_info['name']} ({lang_info['code']})")
+        print("-" * 60)
         
         try:
-            choice = int(input("\nSelect language (default: 1 - English): ").strip() or "1")
+            choice = int(input("\nSelect model option (default: 1 - English): ").strip() or "1")
         except ValueError:
             choice = 1
     
-    # Validate choice
+    # ============================================
+    # OPTION 13: Manual entry (model name)
+    # ============================================
+    if choice == 13:
+        if RICH_AVAILABLE:
+            console.print("\n[yellow]Manual Model Name Entry[/yellow]")
+            console.print("[dim]Enter any valid MFA model name. Examples:[/dim]")
+            console.print("  - [cyan]english_mfa[/cyan] (standard English model)")
+            console.print("  - [cyan]spanish_mfa[/cyan] (standard Spanish model)")
+            console.print("  - [cyan]french_mfa[/cyan] (standard French model)")
+            console.print("  - [cyan]mandarin_mfa[/cyan] (Mandarin Chinese model)")
+            console.print("\n[dim]Custom models you've downloaded or trained:[/dim]")
+            console.print("  - [cyan]my_custom_english_model[/cyan]")
+            console.print("  - [cyan]librispeech_english[/cyan]")
+            
+            manual_code = Prompt.ask("Enter MFA model name")
+        else:
+            print("\nManual Model Name Entry")
+            print("Examples: english_mfa, spanish_mfa, my_custom_model")
+            manual_code = input("Enter MFA model name: ").strip()
+        
+        if manual_code:
+            if RICH_AVAILABLE:
+                console.print(f"[green]Using manual model: {manual_code}[/green]")
+                console.print(f"[dim]MFA will look for this model in its default models directory[/dim]")
+            else:
+                print(f"Using manual model: {manual_code}")
+            return manual_code  # Return as-is, will be normalized later
+        else:
+            if RICH_AVAILABLE:
+                console.print("[yellow]No model entered, falling back to English[/yellow]")
+            else:
+                print("No model entered, falling back to English")
+            return "english"  # Normalized to english_mfa later
+    
+    # ============================================
+    # OPTION 14: Browse available MFA models
+    # ============================================
+    if choice == 14:
+        if not available_models:
+            if RICH_AVAILABLE:
+                console.print("[red]No MFA models found on this system.[/red]")
+                console.print("[yellow]You can download models using:[/yellow]")
+                console.print("  [cyan]mfa model download acoustic english_mfa[/cyan]")
+                console.print("  [cyan]mfa model download dictionary english_mfa[/cyan]")
+                console.print("\nOr use manual entry (option 13) to specify a model name to download.")
+            else:
+                print("No MFA models found on this system.")
+                print("Download models with: mfa model download acoustic english_mfa")
+            
+            # Offer to download a standard model
+            if RICH_AVAILABLE:
+                download_choice = Confirm.ask("Download a standard model now?", default=False)
+            else:
+                download_choice = input("Download a standard model now? (y/N): ").lower() == 'y'
+            
+            if download_choice:
+                if RICH_AVAILABLE:
+                    standard_model = Prompt.ask("Enter model name to download", default="english_mfa")
+                else:
+                    standard_model = input("Enter model name to download [english_mfa]: ").strip() or "english_mfa"
+                
+                try:
+                    console.print(f"[dim]Downloading {standard_model}...[/dim]" if RICH_AVAILABLE else f"Downloading {standard_model}...")
+                    subprocess.run(["mfa", "model", "download", "acoustic", standard_model], check=True)
+                    subprocess.run(["mfa", "model", "download", "dictionary", standard_model], check=True)
+                    console.print(f"[green]Successfully downloaded {standard_model}[/green]" if RICH_AVAILABLE else f"Successfully downloaded {standard_model}")
+                    return standard_model  # Return as-is
+                except subprocess.CalledProcessError as e:
+                    console.print(f"[red]Failed to download {standard_model}[/red]" if RICH_AVAILABLE else f"Failed to download {standard_model}")
+                    return "english"
+            else:
+                return "english"
+        
+        # Display available models
+        if RICH_AVAILABLE:
+            model_table = Table(title="Available MFA Models on Your System")
+            model_table.add_column("#", style="cyan", no_wrap=True)
+            model_table.add_column("Model Name", style="green")
+            model_table.add_column("Type", style="dim")
+            
+            for idx, model in enumerate(available_models, 1):
+                # Try to guess if it's a standard model
+                if model.endswith("_mfa"):
+                    model_type = "standard"
+                else:
+                    model_type = "custom"
+                model_table.add_row(str(idx), model, model_type)
+            
+            console.print(model_table)
+            console.print("[dim]Enter the number of the model to use, or type a custom name[/dim]")
+            model_choice = Prompt.ask("Select model", default="1")
+        else:
+            print("\nAvailable MFA Models on Your System:")
+            for idx, model in enumerate(available_models, 1):
+                print(f"  {idx}. {model}")
+            model_choice = input("\nSelect model (number) or type custom name [1]: ").strip() or "1"
+        
+        # Check if input is a number (select from list) or custom name
+        try:
+            idx = int(model_choice) - 1
+            if 0 <= idx < len(available_models):
+                selected_model = available_models[idx]
+                if RICH_AVAILABLE:
+                    console.print(f"[green]Selected: {selected_model}[/green]")
+                else:
+                    print(f"Selected: {selected_model}")
+                return selected_model  # Return as-is
+            else:
+                raise ValueError("Index out of range")
+        except ValueError:
+            # Not a number or invalid index - treat as custom model name
+            if model_choice.strip():
+                if RICH_AVAILABLE:
+                    console.print(f"[green]Using custom model name: {model_choice}[/green]")
+                else:
+                    print(f"Using custom model name: {model_choice}")
+                return model_choice.strip()  # Return as-is
+            else:
+                if RICH_AVAILABLE:
+                    console.print("[yellow]No model selected, falling back to English[/yellow]")
+                else:
+                    print("No model selected, falling back to English")
+                return "english"  # Normalized later
+    
+    # ============================================
+    # OPTION 15: Enter custom model path
+    # ============================================
+    if choice == 15:
+        if RICH_AVAILABLE:
+            console.print("\n[yellow]Custom Model Path Entry[/yellow]")
+            console.print("[dim]Enter the full filesystem path to your custom MFA model.[/dim]")
+            console.print("[dim]MFA expects a directory containing:[/dim]")
+            console.print("  - [cyan].pt[/cyan] or [cyan].pt.ckpt[/cyan] acoustic model file")
+            console.print("  - [cyan].dict[/cyan] dictionary file")
+            console.print("\n[dim]Examples:[/dim]")
+            console.print("  - [cyan]/home/user/models/my_spanish_model[/cyan]")
+            console.print("  - [cyan]C:\\Users\\Name\\mfa_models\\custom_english[/cyan]")
+            console.print("  - [cyan]./models/mfa/catalan_model[/cyan]")
+            
+            custom_path = Prompt.ask("Enter full path to custom model directory")
+        else:
+            print("\nCustom Model Path Entry")
+            print("Enter the full filesystem path to your custom MFA model directory.")
+            print("Examples: /home/user/models/my_model, ./models/custom_model")
+            custom_path = input("Enter path: ").strip()
+        
+        if custom_path:
+            # Validate the path exists
+            path_obj = Path(custom_path)
+            if path_obj.exists():
+                if RICH_AVAILABLE:
+                    console.print(f"[green]Using custom model path: {custom_path}[/green]")
+                    console.print(f"[dim]Note: MFA will use this exact path. Make sure the model files are valid.[/dim]")
+                else:
+                    print(f"Using custom model path: {custom_path}")
+                return str(custom_path)  # Return path as-is
+            else:
+                if RICH_AVAILABLE:
+                    console.print(f"[yellow]Warning: Path '{custom_path}' does not exist.[/yellow]")
+                    use_anyway = Confirm.ask("Use it anyway? (MFA will fail if invalid)", default=False)
+                else:
+                    use_anyway = input(f"Warning: Path '{custom_path}' does not exist. Use anyway? (y/N): ").lower() == 'y'
+                
+                if use_anyway:
+                    return str(custom_path)
+                else:
+                    if RICH_AVAILABLE:
+                        console.print("[yellow]Falling back to English[/yellow]")
+                    else:
+                        print("Falling back to English")
+                    return "english"
+        else:
+            if RICH_AVAILABLE:
+                console.print("[yellow]No path entered, falling back to English[/yellow]")
+            else:
+                print("No path entered, falling back to English")
+            return "english"
+    
+    # ============================================
+    # STANDARD OPTIONS (1-12)
+    # ============================================
     if choice not in LANGUAGE_OPTIONS:
-        console.print(f"[yellow]Invalid choice {choice}, using English[/yellow]" if RICH_AVAILABLE else f"Invalid choice {choice}, using English")
-        return "english"
+        if RICH_AVAILABLE:
+            console.print(f"[yellow]Invalid choice {choice}, using English[/yellow]")
+        else:
+            print(f"Invalid choice {choice}, using English")
+        return "english"  # Return base name, will be normalized to english_mfa
     
     selected = LANGUAGE_OPTIONS[choice]
-    console.print(f"[green]Selected: {selected['name']}[/green]" if RICH_AVAILABLE else f"Selected: {selected['name']}")
-    return selected["code"]
+    model_base = selected["code"]  # This is "spanish", not "spanish_mfa"
+    
+    if RICH_AVAILABLE:
+        console.print(f"[green]Selected: {selected['name']} → {model_base}_mfa[/green]")
+    else:
+        print(f"Selected: {selected['name']} → {model_base}_mfa")
+    
+    return model_base  # Return just "spanish" - normalization will add _mfa once
 
 # ============================================================================
 # ENHANCED CONFIGURATION PROMPTS
 # ============================================================================
 
 def configure_syllabification() -> Dict[str, Any]:
-    """Present all syllabification configuration options to user."""
+    """Present syllabification configuration options to user."""
     config = {
         'enabled': False,
-        'use_dictionary': True,
-        'use_acoustic': True,
+        'use_rules': True,                    # NEW - rule-based proofreading
         'dictionary_path': "./models/syllable_dicts",
         'acoustic_threshold': 0.3,
         'frame_size': 256,
-        'hop_size': 128,
-        'fallback_order': 'dictionary_first'  # or 'acoustic_first'
+        'hop_size': 128
     }
     
     if not RICH_AVAILABLE:
@@ -267,36 +533,32 @@ def configure_syllabification() -> Dict[str, Any]:
             return {'enabled': False}
         
         config['enabled'] = True
-        config['use_dictionary'] = input("Use dictionary lookup? (Y/n): ").lower() != 'n'
-        config['use_acoustic'] = input("Use acoustic analysis? (Y/n): ").lower() != 'n'
         
-        if config['use_dictionary']:
-            dict_path = input(f"Dictionary path [{config['dictionary_path']}]: ").strip()
-            if dict_path:
-                config['dictionary_path'] = dict_path
+        # Dictionary path (optional to change)
+        dict_path = input(f"Dictionary path [{config['dictionary_path']}]: ").strip()
+        if dict_path:
+            config['dictionary_path'] = dict_path
         
-        if config['use_acoustic']:
-            try:
-                threshold = input(f"Peak detection threshold (0.0-1.0) [{config['acoustic_threshold']}]: ").strip()
-                if threshold:
-                    config['acoustic_threshold'] = float(threshold)
-                
-                frame_size = input(f"Frame size [{config['frame_size']}]: ").strip()
-                if frame_size:
-                    config['frame_size'] = int(frame_size)
-                
-                hop_size = input(f"Hop size [{config['hop_size']}]: ").strip()
-                if hop_size:
-                    config['hop_size'] = int(hop_size)
-            except ValueError:
-                print("Invalid input, using defaults")
+        # Rule-based proofreading toggle
+        use_rules = input("Enable rule-based proofreading? (Y/n): ").lower() != 'n'
+        config['use_rules'] = use_rules
         
-        if config['use_dictionary'] and config['use_acoustic']:
-            print("\nFallback order:")
-            print("  1. dictionary_first (Try dictionary first, fall back to acoustic)")
-            print("  2. acoustic_first (Try acoustic first, fall back to dictionary)")
-            choice = input("Select fallback order (1/2) [1]: ").strip() or "1"
-            config['fallback_order'] = 'dictionary_first' if choice == "1" else 'acoustic_first'
+        # Acoustic parameters
+        print("\n--- Acoustic Analysis Parameters ---")
+        try:
+            threshold = input(f"Peak detection threshold (0.0-1.0) [{config['acoustic_threshold']}]: ").strip()
+            if threshold:
+                config['acoustic_threshold'] = float(threshold)
+            
+            frame_size = input(f"Frame size [{config['frame_size']}]: ").strip()
+            if frame_size:
+                config['frame_size'] = int(frame_size)
+            
+            hop_size = input(f"Hop size [{config['hop_size']}]: ").strip()
+            if hop_size:
+                config['hop_size'] = int(hop_size)
+        except ValueError:
+            print("Invalid input, using defaults")
         
         return config
     
@@ -307,55 +569,41 @@ def configure_syllabification() -> Dict[str, Any]:
     if not config['enabled']:
         return {'enabled': False}
     
-    config['use_dictionary'] = Confirm.ask("Use dictionary lookup?", default=True)
-    config['use_acoustic'] = Confirm.ask("Use acoustic analysis?", default=True)
+    # Dictionary path (still configurable)
+    config['dictionary_path'] = Prompt.ask(
+        "Dictionary path", 
+        default=config['dictionary_path']
+    )
     
-    if config['use_dictionary']:
-        config['dictionary_path'] = Prompt.ask(
-            "Dictionary path", 
-            default=config['dictionary_path']
-        )
+    # Rule-based proofreading toggle
+    console.print("\n[dim]Rule-based proofreading applies linguistic rules to correct syllable errors[/dim]")
+    config['use_rules'] = Confirm.ask("Enable rule-based proofreading?", default=True)
     
-    if config['use_acoustic']:
-        console.print("\n[dim]Acoustic analysis parameters:[/dim]")
-        config['acoustic_threshold'] = FloatPrompt.ask(
-            "Peak detection threshold (0.0-1.0)", 
-            default=config['acoustic_threshold']
-        )
-        config['frame_size'] = IntPrompt.ask(
-            "Frame size (samples)", 
-            default=config['frame_size']
-        )
-        config['hop_size'] = IntPrompt.ask(
-            "Hop size (samples)", 
-            default=config['hop_size']
-        )
+    # Acoustic parameters
+    console.print("\n[bold]Acoustic Analysis Parameters[/bold]")
+    console.print("[dim]Used to refine syllable timing boundaries[/dim]")
     
-    if config['use_dictionary'] and config['use_acoustic']:
-        console.print("\n[dim]Fallback behavior:[/dim]")
-        console.print("  1. dictionary_first (Try dictionary first, fall back to acoustic)")
-        console.print("  2. acoustic_first (Try acoustic first, fall back to dictionary)")
-        
-        fallback_choice = Prompt.ask(
-            "Select fallback order",
-            choices=["1", "2"],
-            default="1"
-        )
-        
-        config['fallback_order'] = 'dictionary_first' if fallback_choice == "1" else 'acoustic_first'
+    config['acoustic_threshold'] = FloatPrompt.ask(
+        "Peak detection threshold (0.0-1.0, lower = more sensitive)", 
+        default=config['acoustic_threshold']
+    )
+    config['frame_size'] = IntPrompt.ask(
+        "Frame size (samples)", 
+        default=config['frame_size']
+    )
+    config['hop_size'] = IntPrompt.ask(
+        "Hop size (samples)", 
+        default=config['hop_size']
+    )
     
     # Display summary
     console.print("\n[green]Syllabification Configuration Summary:[/green]")
-    console.print(f"  Dictionary: {config['use_dictionary']}")
-    if config['use_dictionary']:
-        console.print(f"    Path: {config['dictionary_path']}")
-    console.print(f"  Acoustic: {config['use_acoustic']}")
-    if config['use_acoustic']:
-        console.print(f"    Threshold: {config['acoustic_threshold']}")
-        console.print(f"    Frame size: {config['frame_size']}")
-        console.print(f"    Hop size: {config['hop_size']}")
-    if config['use_dictionary'] and config['use_acoustic']:
-        console.print(f"  Fallback order: {config['fallback_order']}")
+    console.print(f"  Dictionary path: {config['dictionary_path']}")
+    console.print(f"  Rule-based proofreading: {'enabled' if config['use_rules'] else 'disabled'}")
+    console.print(f"  Acoustic threshold: {config['acoustic_threshold']}")
+    console.print(f"  Frame size: {config['frame_size']}")
+    console.print(f"  Hop size: {config['hop_size']}")
+    console.print("\n[dim]Note: Dictionary lookup + acoustic refinement are always used in pipeline order[/dim]")
     
     return config
 
@@ -462,6 +710,73 @@ def configure_pos_tagging() -> Dict[str, Any]:
     console.print("\n[dim]Models that will be used:[/dim]")
     for lang, base in config['model_map'].items():
         console.print(f"  {lang}: {base}_{config['model_size']}")
+    
+    return config
+
+def configure_intonation(language: str, syllabification_enabled: bool = False) -> Dict[str, Any]:
+    """
+    Present intonation configuration options to user.
+    Only offered if language is Spanish AND syllabification is enabled.
+    """
+    config = {
+        'enabled': False,
+        'language': language,
+        'clitics_path': None
+    }
+    
+    # Only offer if language is Spanish AND syllabification is enabled
+    if language != 'spanish':
+        if RICH_AVAILABLE:
+            console.print(f"[dim]Intonation analysis is only available for Spanish (current language: {language}). Skipping.[/dim]")
+        else:
+            print(f"Intonation analysis is only available for Spanish (current language: {language}). Skipping.")
+        return config
+    
+    if not syllabification_enabled:
+        if RICH_AVAILABLE:
+            console.print(f"[dim]Intonation analysis requires syllabification to be enabled. Skipping.[/dim]")
+        else:
+            print(f"Intonation analysis requires syllabification to be enabled. Skipping.")
+        return config
+    
+    if not RICH_AVAILABLE:
+        # Fallback text prompts
+        print("\n--- INTONATION ANALYSIS CONFIGURATION ---")
+        enable = input("Enable intonation analysis (Break Index assignment)? (y/N): ").lower() == 'y'
+        if not enable:
+            return {'enabled': False}
+        
+        config['enabled'] = True
+        
+        clitics_path = input("Custom clitics file path (leave empty for default): ").strip()
+        if clitics_path:
+            config['clitics_path'] = clitics_path
+        
+        return config
+    
+    # Rich interactive configuration
+    console.print(Panel("[bold cyan]Intonation Analysis Configuration[/bold cyan]"))
+    console.print("[dim]Break Index assignment for Spanish prosodic analysis[/dim]")
+    console.print("[dim]Note: This requires syllabification to provide syllable boundaries[/dim]")
+    
+    config['enabled'] = Confirm.ask("Enable intonation analysis (Break Index assignment)?", default=False)
+    if not config['enabled']:
+        return {'enabled': False}
+    
+    config['clitics_path'] = Prompt.ask(
+        "Custom clitics file path (leave empty for default)",
+        default=""
+    )
+    if not config['clitics_path']:
+        config['clitics_path'] = None
+    
+    # Display summary
+    console.print("\n[green]Intonation Configuration Summary:[/green]")
+    console.print(f"  Language: Spanish")
+    if config['clitics_path']:
+        console.print(f"  Custom clitics: {config['clitics_path']}")
+    else:
+        console.print(f"  Clitics: Default (models/intonation/clitics.csv)")
     
     return config
 
@@ -725,10 +1040,13 @@ def create_mfa_corpus(family: AudioProjectFamily, corpus_base: Path) -> List[Dic
 
 def run_mfa_alignment(corpus_dir: Path, language: str, mfa_out: Path, auto_download: bool = True) -> bool:
     """Execute MFA align command."""
+    # Normalize the model name (don't double-add _mfa)
+    model_name = normalize_mfa_model_name(language)
+    
     # Check if model exists first
-    if not check_mfa_model(language, auto_download):
-        logger.error(f"MFA model for {language} not available")
-        console.print(f"[red]MFA model for {language} not available. Run 'mfa model download {language}_mfa' to install.[/red]" if RICH_AVAILABLE else f"MFA model for {language} not available")
+    if not check_mfa_model(model_name, auto_download):
+        logger.error(f"MFA model for {model_name} not available")
+        console.print(f"[red]MFA model for {model_name} not available. Run 'mfa model download {model_name}' to install.[/red]" if RICH_AVAILABLE else f"MFA model for {model_name} not available")
         return False
     
     # Check if corpus directory has files
@@ -740,7 +1058,6 @@ def run_mfa_alignment(corpus_dir: Path, language: str, mfa_out: Path, auto_downl
     console.print(f"Found {len(wav_files)} chunks to align" if RICH_AVAILABLE else f"Found {len(wav_files)} chunks to align")
     
     try:
-        model_name = f"{language}_mfa"
         cmd = [
             "mfa", "align", 
             str(corpus_dir), 
@@ -908,6 +1225,7 @@ def reconstruct_aligned_textgrid(family: AudioProjectFamily, mfa_raw_dir: Path, 
             output_subdir = output_dir / relative_dir
         else:
             # Audio is in the root audio directory
+            relative_dir = Path(".")  # Define relative_dir as current directory
             output_subdir = output_dir
         
         output_subdir.mkdir(parents=True, exist_ok=True)
@@ -917,11 +1235,25 @@ def reconstruct_aligned_textgrid(family: AudioProjectFamily, mfa_raw_dir: Path, 
         if clean_stem.endswith('_preprocessed'):
             clean_stem = clean_stem[:-13]  # Remove '_preprocessed' (13 characters)
         
-        output_path = output_subdir / f"{clean_stem}_aligned.TextGrid"
-        new_tg.save(str(output_path), format="long_textgrid", includeBlankSpaces=True)
+        # ============================================
+        # SAVE TO aligned_textgrids/ with _aligned suffix
+        # ============================================
+        aligned_output_path = output_subdir / f"{clean_stem}_aligned.TextGrid"
+        new_tg.save(str(aligned_output_path), format="long_textgrid", includeBlankSpaces=True)
+        
+        # ============================================
+        # ALSO SAVE COPY TO final_textgrids/ WITHOUT _aligned suffix
+        # ============================================
+        final_textgrids_dir = Path("./final_textgrids") / relative_dir
+        final_output_path = final_textgrids_dir / f"{clean_stem}.TextGrid"
+        final_output_path.parent.mkdir(parents=True, exist_ok=True)
+        
+        # Save a copy to final_textgrids (stripping the _aligned suffix)
+        new_tg.save(str(final_output_path), format="long_textgrid", includeBlankSpaces=True)
         
         # DEBUG: Log what tiers were saved
-        logger.info(f"Saved aligned TextGrid with {len(new_tg.tierNames)} tiers: {output_path}")
+        logger.info(f"Saved aligned TextGrid with {len(new_tg.tierNames)} tiers: {aligned_output_path}")
+        logger.info(f"Saved copy to final_textgrids: {final_output_path}")
         for tier_name in new_tg.tierNames:
             tier = new_tg.getTier(tier_name)
             if hasattr(tier, 'entries'):
@@ -929,7 +1261,13 @@ def reconstruct_aligned_textgrid(family: AudioProjectFamily, mfa_raw_dir: Path, 
             elif hasattr(tier, 'points'):
                 logger.info(f"  - {tier_name}: {len(tier.points)} points")
                 
-        console.print(f"Saved aligned TextGrid: {output_path}" if RICH_AVAILABLE else f"Saved aligned TextGrid: {output_path}")
+        if RICH_AVAILABLE:
+            console.print(f"Saved aligned TextGrid: {aligned_output_path}")
+            console.print(f"[dim]Also saved copy to: {final_output_path}[/dim]")
+        else:
+            print(f"Saved aligned TextGrid: {aligned_output_path}")
+            print(f"Also saved copy to: {final_output_path}")
+        
         return True
     except Exception as e:
         logger.error(f"Failed to save aligned TextGrid: {e}")
@@ -952,24 +1290,15 @@ def run_syllabification_sub(aligned_dir: Path, audio_dir: Path, language: str, c
         kwargs = {
             'aligned_dir': str(aligned_dir),
             'audio_dir': str(audio_dir),
-            'language': language
+            'language': language,
+            'use_dictionary': True,                          # Always True
+            'use_acoustic': True,                            # Always True
+            'use_rules': config.get('use_rules', True),      # NEW
+            'dict_dir': config.get('dictionary_path', "./models/syllable_dicts"),
+            'threshold': config.get('acoustic_threshold', 0.3),
+            'frame_size': config.get('frame_size', 256),
+            'hop_size': config.get('hop_size', 128)
         }
-        
-        # Add all configured parameters
-        if 'dictionary_path' in config:
-            kwargs['dict_dir'] = config['dictionary_path']
-        if 'acoustic_threshold' in config:
-            kwargs['threshold'] = config['acoustic_threshold']
-        if 'frame_size' in config:
-            kwargs['frame_size'] = config['frame_size']
-        if 'hop_size' in config:
-            kwargs['hop_size'] = config['hop_size']
-        if 'use_dictionary' in config:
-            kwargs['use_dictionary'] = config['use_dictionary']
-        if 'use_acoustic' in config:
-            kwargs['use_acoustic'] = config['use_acoustic']
-        if 'fallback_order' in config:
-            kwargs['fallback_order'] = config['fallback_order']
         
         console.print("\nRunning syllabification with custom configuration..." if RICH_AVAILABLE else "\nRunning syllabification...")
         run_syllabification(**kwargs)
@@ -1008,6 +1337,42 @@ def run_tagging_sub(aligned_dir: Path, language: str, config: Dict):
     except Exception as e:
         logger.error(f"Error in POS tagging: {e}")
 
+def run_intonation_sub(aligned_dir: Path, language: str, config: Dict):
+    """Hook for libs/intonalyze_A.py with full configuration."""
+    if not config.get('enabled', False):
+        console.print("Intonation analysis skipped (disabled in configuration)" if RICH_AVAILABLE else "Intonation analysis skipped")
+        return
+    
+    # Double-check language is Spanish
+    if language != 'spanish':
+        console.print("[yellow]Intonation analysis is only available for Spanish. Skipping.[/yellow]" if RICH_AVAILABLE else "Intonation analysis is only available for Spanish. Skipping.")
+        return
+    
+    try:
+        # Import from libs/ directory - use correct filename
+        from libs.intonalyze_A import run_intonation
+        
+        console.print("\nRunning intonation analysis (Break Index assignment)..." if RICH_AVAILABLE else "\nRunning intonation analysis...")
+        
+        stats = run_intonation(
+            aligned_dir=str(aligned_dir),
+            language=language,
+            clitics_path=config.get('clitics_path')
+        )
+        
+        # Display results
+        if RICH_AVAILABLE:
+            console.print(f"\n[green]Intonation analysis complete: {stats['success']} files processed[/green]")
+        else:
+            print(f"\nIntonation analysis complete: {stats['success']} files processed")
+        
+    except ImportError as e:
+        logger.error(f"Intonation module not found: {e}")
+        console.print("[red]Error: libs/intonalyze_A.py not found. Skipping intonation analysis.[/red]" if RICH_AVAILABLE else "Error: libs/intonalyze_A.py not found")
+    except Exception as e:
+        logger.error(f"Error in intonation analysis: {e}")
+        console.print(f"[red]Error in intonation analysis: {e}[/red]" if RICH_AVAILABLE else f"Error in intonation analysis: {e}")
+
 # ============================================================================
 # MAIN WORKFLOW WITH FAMILY SUPPORT
 # ============================================================================
@@ -1033,6 +1398,10 @@ def main():
     interactive_mode = not args.non_interactive and (args.textgrid_dir is None or args.audio_dir is None)
     
     if interactive_mode:
+        # ====================================================================
+        # INTERACTIVE MODE
+        # ====================================================================
+        
         # 1. Basic inputs - interactive
         lang = select_language()
         
@@ -1040,15 +1409,23 @@ def main():
         tg_in = select_textgrid_directory()
         audio_in = select_audio_directory()
         
-        # 3. Get full configurations for subscripts
+        # 3. Get full configurations for ALL subscripts (grouped together)
+        console.print("\n[bold cyan]Post-Alignment Annotation Configuration[/bold cyan]" if RICH_AVAILABLE else "\n=== POST-ALIGNMENT ANNOTATION CONFIGURATION ===")
+        
+        # Ask about all annotation options in sequence
         syllabify_config = configure_syllabification()
+        intonation_config = configure_intonation(lang, syllabify_config.get('enabled', False))
         pos_config = configure_pos_tagging()
         
         # Define paths
         out_dir = Path("./aligned_textgrids")
         mfa_auto_download = True  # Default to True in interactive mode
+        
     else:
-        # Non-interactive mode - use command line arguments
+        # ====================================================================
+        # NON-INTERACTIVE MODE
+        # ====================================================================
+        
         # If --non-interactive is set but arguments missing, show error
         if args.non_interactive and (args.textgrid_dir is None or args.audio_dir is None):
             console.print("[red]Error: In non-interactive mode, --textgrid-dir and --audio-dir are required[/red]" if RICH_AVAILABLE else "Error: In non-interactive mode, --textgrid-dir and --audio-dir are required")
@@ -1065,13 +1442,11 @@ def main():
         # Build syllabification config from arguments
         syllabify_config = {
             'enabled': args.enable_syllabification,
-            'use_dictionary': args.syllabification_use_dictionary,
-            'use_acoustic': args.syllabification_use_acoustic,
+            'use_rules': getattr(args, 'syllabification_use_rules', True),  # NEW
             'dictionary_path': args.syllabification_dict_dir,
             'acoustic_threshold': args.syllabification_threshold,
             'frame_size': args.syllabification_frame_size,
-            'hop_size': args.syllabification_hop_size,
-            'fallback_order': args.syllabification_fallback
+            'hop_size': args.syllabification_hop_size
         }
         
         # Build POS tagging config from arguments
@@ -1096,6 +1471,12 @@ def main():
             }
         }
         
+        # Build intonation config from arguments
+        intonation_config = {
+            'enabled': args.enable_intonation,
+            'clitics_path': args.intonation_clitics_path
+        }
+        
         # Validate directories
         if not tg_in.exists():
             console.print(f"[red]Error: TextGrid directory not found: {tg_in}[/red]" if RICH_AVAILABLE else f"Error: TextGrid directory not found: {tg_in}")
@@ -1105,6 +1486,10 @@ def main():
             console.print(f"[red]Error: Audio directory not found: {audio_in}[/red]" if RICH_AVAILABLE else f"Error: Audio directory not found: {audio_in}")
             return
 
+    # ====================================================================
+    # COMMON WORKFLOW (both interactive and non-interactive)
+    # ====================================================================
+    
     # Define paths
     temp_corpus = Path("./temp_mfa_corpus")
     mfa_temp_dir = Path("./mfa_temp")
@@ -1219,6 +1604,7 @@ def main():
     # 3. Subscript Execution with full configurations
     run_syllabification_sub(out_dir, audio_in, lang, syllabify_config)
     run_tagging_sub(out_dir, lang, pos_config)
+    run_intonation_sub(out_dir, lang, intonation_config)  # Will only run if language is Spanish and enabled
 
     # 4. Enhanced Summary
     if RICH_AVAILABLE:
@@ -1235,17 +1621,10 @@ def main():
         
         # Syllabification details
         if syllabify_config['enabled']:
-            summary.add_row("", "")
-            summary.add_row("[green]Syllabification[/green]", "ENABLED")
-            summary.add_row("  Dictionary", "Yes" if syllabify_config.get('use_dictionary') else "No")
-            if syllabify_config.get('use_dictionary'):
-                summary.add_row("  Dict Path", syllabify_config['dictionary_path'])
-            summary.add_row("  Acoustic", "Yes" if syllabify_config.get('use_acoustic') else "No")
-            if syllabify_config.get('use_acoustic'):
-                summary.add_row("  Threshold", str(syllabify_config['acoustic_threshold']))
-                summary.add_row("  Frame/Hop", f"{syllabify_config['frame_size']}/{syllabify_config['hop_size']}")
-            if syllabify_config.get('use_dictionary') and syllabify_config.get('use_acoustic'):
-                summary.add_row("  Fallback", syllabify_config['fallback_order'])
+            print(f"  Dictionary Path: {syllabify_config['dictionary_path']}")
+            print(f"  Rules: {syllabify_config.get('use_rules')}")
+            print(f"  Acoustic Threshold: {syllabify_config['acoustic_threshold']}")
+            print(f"  Frame/Hop: {syllabify_config['frame_size']}/{syllabify_config['hop_size']}")
         else:
             summary.add_row("", "")
             summary.add_row("[yellow]Syllabification[/yellow]", "DISABLED")
@@ -1262,6 +1641,21 @@ def main():
         else:
             summary.add_row("", "")
             summary.add_row("[yellow]POS Tagging[/yellow]", "DISABLED")
+        
+        # Intonation details
+        if intonation_config.get('enabled', False) and lang == 'spanish':
+            summary.add_row("", "")
+            summary.add_row("[green]Intonation Analysis[/green]", "ENABLED")
+            if intonation_config.get('clitics_path'):
+                summary.add_row("  Custom Clitics", intonation_config['clitics_path'])
+            else:
+                summary.add_row("  Clitics", "Default (models/intonation/clitics.csv)")
+        elif lang != 'spanish' and intonation_config.get('enabled', False):
+            summary.add_row("", "")
+            summary.add_row("[yellow]Intonation Analysis[/yellow]", "SKIPPED (Spanish only)")
+        else:
+            summary.add_row("", "")
+            summary.add_row("[yellow]Intonation Analysis[/yellow]", "DISABLED")
         
         console.print(summary)
     else:
@@ -1282,6 +1676,10 @@ def main():
         if pos_config['enabled']:
             print(f"  Model Size: {pos_config['model_size']}")
             print(f"  Tag Type: {pos_config['tag_type']}")
+        print(f"\nIntonation Analysis: {'ENABLED' if intonation_config.get('enabled') and lang == 'spanish' else 'DISABLED'}")
+        if intonation_config.get('enabled') and lang == 'spanish':
+            if intonation_config.get('clitics_path'):
+                print(f"  Custom Clitics: {intonation_config['clitics_path']}")
 
 if __name__ == "__main__":
     # Configure logging
