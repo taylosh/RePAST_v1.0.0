@@ -1,17 +1,16 @@
 """
 00_setup.py - Environment Gatekeeper & Smart Initialization
 @author: taylosh
-Created on Mar 14 2025
-Last edited on Mar 16 2026
+Created on 14 Mar 2025
 
 Main initialization script for the overhauled ASR pipeline.
 - Enforces execution within the 'transcriber' Conda environment.
+- MFA installation guidance (installs in transcriber environment).
 - Builds necessary directory structures for Phase 1-3.
 - Interactive Hugging Face token management.
 - Hardware verification via Unified GPU Backend (AMD & NVIDIA support).
 - Smart dependency installation with skip-if-exists logic.
 - Generates lock file for reproducible environments.
-- MFA installation guidance (installs in transcriber environment).
 """
 
 import os
@@ -62,16 +61,32 @@ def check_and_enforce_environment(env_name: str = "transcriber"):
     else:
         console.print(f"[yellow]Environment '{env_name}' not found. Creating it now...[/yellow]")
         try:
+            # 1. Create environment with Python 3.9
             subprocess.run(['conda', 'create', '-n', env_name, 'python=3.9', '-y'], check=True)
-            console.print(f"\n[green]Environment '{env_name}' created successfully.[/green]")
+            
+            # 2. Install Montreal Forced Aligner (conda-forge)
+            console.print(f"  Installing Montreal Forced Aligner in '{env_name}'...")
+            subprocess.run(['conda', 'install', '-n', env_name, '-c', 'conda-forge', 
+                            'montreal-forced-aligner', '-y'], check=True)
+            
+            # 3. Install Rich (pip into the new environment)
+            console.print(f"  Installing Rich in '{env_name}'...")
+            subprocess.run(['conda', 'run', '-n', env_name, 'pip', 'install', 'rich>=13.7.1'], 
+                        check=True)
+            
+            console.print(f"\n[green]Environment '{env_name}' created successfully with MFA and Rich.[/green]")
             console.print("\n[bold]NEXT STEPS:[/bold]")
             console.print(f"  1. Activate the environment: [bold]conda activate {env_name}[/bold]")
             console.print("  2. Run this setup script again: [bold]python libs/00_setup.py[/bold]")
-            console.print("\nThe environment is empty - the setup script will install all dependencies.")
+            console.print("\n[dim]Note: MFA is already installed (Python 3.9 ensures compatibility).[/dim]")
+            
         except subprocess.CalledProcessError as e:
             console.print(f"[red]Failed to create environment: {e}[/red]")
             console.print("Please create manually:")
             console.print(f"  conda create -n {env_name} python=3.9")
+            console.print(f"  conda activate {env_name}")
+            console.print("  conda install -c conda-forge montreal-forced-aligner")
+            console.print("  pip install rich")
         sys.exit(0)
 
 # ============================================================================
@@ -292,6 +307,9 @@ class PipelineSetup:
             # Phase 3
             'aligned_textgrids',
             
+            # Final output
+            'final_textgrids',               # ADDED - final processed TextGrids
+            
             # Models (empty - pipeline downloads as needed)
             'models/embeddings',           # For register.py
             'models/syllable_dicts',        # For syllabify.py (optional)
@@ -300,9 +318,9 @@ class PipelineSetup:
             # System
             'logs',
             'bin',                           # Compiled C modules
-            'config'                          # pipeline_config.json
+            'config'                         # pipeline_config.json
         ]
-        
+
         # Package groups with minimum versions
         self.package_groups = {
             'core': [
@@ -530,79 +548,137 @@ class PipelineSetup:
     # ========================================================================
     
     def install_dependencies(self):
-        """Install Python packages, skipping any that are already installed."""
+        """Install Python packages - conda first, then pip. Skip existing."""
         console.print("\n[bold]Checking Python packages...[/bold]")
         
-        # Flatten package list
-        all_packages = []
-        for group, packages in self.package_groups.items():
-            all_packages.extend(packages)
+        # Define packages by installation method
+        # Conda packages (from conda-forge channel)
+        conda_packages = [
+            'numpy>=1.24.0,<2.0.0',
+            'scipy>=1.11.0',
+            'librosa>=0.10.1',
+            'resampy>=0.4.2',      # ADDED per your request
+            'spacy>=3.7.0'         # Package only, no model download
+        ]
         
-        # Separate into "to install" and "skip"
-        to_install = []
+        # Pip packages (all others from original)
+        pip_packages = [
+            'soundfile>=0.12.1',
+            'requests>=2.31.0',
+            'rich>=13.7.1',
+            'noisereduce>=3.0.2',
+            'pyloudnorm>=0.1.1',
+            'speechbrain>=1.0.0',
+            'openai-whisper>=20231117',
+            'praatio>=5.0.0',
+            'espnet<202511',
+            'espnet-model-zoo',
+            'psutil>=5.9.0',
+            's3prl>=0.4.0',
+            'einops>=0.7.0',
+            'packaging>=23.0'
+        ]
         
-        for pkg in all_packages:
-            # Extract base package name and min version
+        # Helper to extract base package name (strip version constraints)
+        def get_base_name(pkg):
             if '>=' in pkg:
-                base_name = pkg.split('>=')[0]
-                min_version = pkg.split('>=')[1].split(',')[0] if ',' in pkg else pkg.split('>=')[1]
+                return pkg.split('>=')[0]
             elif '<' in pkg:
-                base_name = pkg.split('<')[0]
-                min_version = None
+                return pkg.split('<')[0]
             else:
-                base_name = pkg
-                min_version = None
-            
-            if ComponentChecker.package_installed(base_name, min_version):
+                return pkg
+        
+        # ============================================
+        # CONDA PACKAGES (batches of 3)
+        # ============================================
+        console.print("\n  [bold]Checking conda packages...[/bold]")
+        
+        conda_to_install = []
+        for pkg in conda_packages:
+            base_name = get_base_name(pkg)
+            if ComponentChecker.package_installed(base_name):
                 self.tracker.add_package_result(base_name, 'skipped')
-                console.print(f"  [yellow][/yellow] {base_name} [dim](exists)[/dim]")
+                console.print(f"    [yellow][/yellow] {base_name} [dim](exists)[/dim]")
             else:
-                to_install.append(pkg)
-                console.print(f"  [dim]→ {pkg} [dim](needed)[/dim]")
+                conda_to_install.append(pkg)
+                console.print(f"    [dim]→ {pkg} [dim](needed)[/dim]")
         
-        if not to_install:
-            console.print("  [green]All packages already installed[/green]")
-            return
-        
-        # Ask for confirmation
-        if RICH_AVAILABLE:
-            if not Confirm.ask(f"Install {len(to_install)} missing packages?"):
-                console.print("[yellow]Package installation skipped[/yellow]")
-                for pkg in to_install:
-                    base_name = pkg.split('>=')[0].split('<')[0]
-                    self.tracker.add_package_result(base_name, 'failed')
-                return
-        
-        # Install in batches to avoid command line length limits
-        batch_size = 20
-        for i in range(0, len(to_install), batch_size):
-            batch = to_install[i:i+batch_size]
-            console.print(f"  Installing batch {i//batch_size + 1}/{(len(to_install)-1)//batch_size + 1}...")
-            
-            try:
-                subprocess.run(['pip', 'install'] + batch, check=True, capture_output=True)
-                for pkg in batch:
-                    base_name = pkg.split('>=')[0].split('<')[0]
-                    self.tracker.add_package_result(base_name, 'installed')
-                console.print(f"    [green]Batch complete[/green]")
-            except subprocess.CalledProcessError as e:
-                console.print(f"    [red]Batch failed[/red]")
-                for pkg in batch:
-                    base_name = pkg.split('>=')[0].split('<')[0]
-                    self.tracker.add_package_result(base_name, 'failed')
-        
-        # Install spaCy model separately
-        if ComponentChecker.package_installed('en_core_web_sm'):
-            console.print(f"  [yellow]en_core_web_sm [dim](exists)[/dim]")
+        if conda_to_install:
+            if RICH_AVAILABLE:
+                if Confirm.ask(f"  Install {len(conda_to_install)} missing conda packages? (recommended)"):
+                    # Install in batches of 3
+                    batch_size = 3
+                    for i in range(0, len(conda_to_install), batch_size):
+                        batch = conda_to_install[i:i+batch_size]
+                        console.print(f"    Installing conda batch {i//batch_size + 1}/{(len(conda_to_install)-1)//batch_size + 1}...")
+                        
+                        # Strip version constraints for conda install
+                        conda_batch_names = [get_base_name(pkg) for pkg in batch]
+                        
+                        try:
+                            subprocess.run(['conda', 'install', '-c', 'conda-forge', '-y'] + conda_batch_names, 
+                                        check=True, capture_output=True)
+                            for pkg in batch:
+                                base = get_base_name(pkg)
+                                self.tracker.add_package_result(base, 'installed')
+                            console.print(f"      [green]Batch complete[/green]")
+                        except subprocess.CalledProcessError as e:
+                            console.print(f"      [red]Batch failed[/red]")
+                            for pkg in batch:
+                                base = get_base_name(pkg)
+                                self.tracker.add_package_result(base, 'failed')
+                else:
+                    console.print("    [yellow]Conda package installation skipped[/yellow]")
+                    for pkg in conda_to_install:
+                        base = get_base_name(pkg)
+                        self.tracker.add_package_result(base, 'failed')
         else:
-            console.print(f"  Installing spaCy English model...")
-            try:
-                subprocess.run([sys.executable, "-m", "spacy", "download", "en_core_web_sm"], 
-                             check=True, capture_output=True)
-                console.print(f"    [green]Installed[/green]")
-            except:
-                console.print(f"    [red]Failed[/red]")
-
+            console.print("    [green]All conda packages already installed[/green]")
+        
+        # ============================================
+        # PIP PACKAGES (batches of 5)
+        # ============================================
+        console.print("\n  [bold]Checking pip packages...[/bold]")
+        
+        pip_to_install = []
+        for pkg in pip_packages:
+            base_name = get_base_name(pkg)
+            if ComponentChecker.package_installed(base_name):
+                self.tracker.add_package_result(base_name, 'skipped')
+                console.print(f"    [yellow][/yellow] {base_name} [dim](exists)[/dim]")
+            else:
+                pip_to_install.append(pkg)
+                console.print(f"    [dim]→ {pkg} [dim](needed)[/dim]")
+        
+        if not pip_to_install:
+            console.print("    [green]All pip packages already installed[/green]")
+        else:
+            if RICH_AVAILABLE:
+                if not Confirm.ask(f"  Install {len(pip_to_install)} missing pip packages?"):
+                    console.print("    [yellow]Pip package installation skipped[/yellow]")
+                    for pkg in pip_to_install:
+                        base = get_base_name(pkg)
+                        self.tracker.add_package_result(base, 'failed')
+                    return
+            
+            # Install in batches of 5 (reduced from 20)
+            batch_size = 5
+            for i in range(0, len(pip_to_install), batch_size):
+                batch = pip_to_install[i:i+batch_size]
+                console.print(f"    Installing pip batch {i//batch_size + 1}/{(len(pip_to_install)-1)//batch_size + 1}...")
+                
+                try:
+                    subprocess.run(['pip', 'install'] + batch, check=True, capture_output=True)
+                    for pkg in batch:
+                        base = get_base_name(pkg)
+                        self.tracker.add_package_result(base, 'installed')
+                    console.print(f"      [green]Batch complete[/green]")
+                except subprocess.CalledProcessError as e:
+                    console.print(f"      [red]Batch failed[/red]")
+                    for pkg in batch:
+                        base = get_base_name(pkg)
+                        self.tracker.add_package_result(base, 'failed')
+                        
     # ========================================================================
     # STEP 6: C MODULES
     # ========================================================================
@@ -641,11 +717,11 @@ class PipelineSetup:
     # ========================================================================
     
     def install_mfa(self):
-        """Install Montreal Forced Aligner via conda-forge in current environment."""
+        """Install Montreal Forced Aligner - but only if not already installed."""
         console.print("\n[bold]Checking Montreal Forced Aligner...[/bold]")
         
         if ComponentChecker.mfa_installed():
-            self.tracker.set_mfa(True, "MFA available")
+            self.tracker.set_mfa(True, "MFA available (pre-installed in environment)")
             console.print(f"  [green]MFA found[/green]")
             return
         
